@@ -1,13 +1,16 @@
-import io
 from pathlib import Path
 from typing import Dict, List, Tuple
+import json
 
 import numpy as np
 import pandas as pd
 import streamlit as st
+
 from sklearn.compose import ColumnTransformer
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import roc_auc_score, confusion_matrix
+from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
@@ -61,7 +64,6 @@ def load_dataset_from_repo() -> pd.DataFrame:
         )
         st.stop()
 
-    # Read CSV
     df = pd.read_csv(DATASET_PATH)
 
     expected = FEATURES + [TARGET]
@@ -159,7 +161,7 @@ def compute_logit_contributions(
             {
                 "Feature": feat,
                 "Value": raw_val,
-                "Scaled": float(scaled_val),
+                "Scaled (z)": float(scaled_val),
                 "Contribution (log-odds)": contrib,
                 "Effect": direction,
             }
@@ -181,6 +183,17 @@ def format_imputation_warnings(x_input: Dict[str, float]) -> List[str]:
     return warnings
 
 
+def top_drivers(contrib_df: pd.DataFrame, k: int = 3) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Return top k positive and top k negative contributors."""
+    up = contrib_df[contrib_df["Contribution (log-odds)"] > 0].sort_values(
+        "Contribution (log-odds)", ascending=False
+    ).head(k)
+    down = contrib_df[contrib_df["Contribution (log-odds)"] < 0].sort_values(
+        "Contribution (log-odds)", ascending=True
+    ).head(k)
+    return up, down
+
+
 # -----------------------------
 # Cached data/model
 # -----------------------------
@@ -193,12 +206,39 @@ def get_data() -> pd.DataFrame:
 
 
 @st.cache_resource(show_spinner=True)
-def train_model(df: pd.DataFrame) -> Pipeline:
-    pipe = make_pipeline()
+def train_and_eval(df: pd.DataFrame):
+    """
+    Train on train split and evaluate on test split (holdout) to avoid in-sample optimism.
+    Returns:
+      - trained pipeline
+      - metrics dict
+      - train/test sizes
+    """
     X = df[FEATURES]
     y = df[TARGET].astype(int)
-    pipe.fit(X, y)
-    return pipe
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, stratify=y, random_state=42
+    )
+
+    pipe = make_pipeline()
+    pipe.fit(X_train, y_train)
+
+    proba_test = pipe.predict_proba(X_test)[:, 1]
+    auc = float(roc_auc_score(y_test, proba_test))
+
+    # confusion matrix at default threshold 0.5 (reported for reference)
+    pred_test = (proba_test >= 0.5).astype(int)
+    cm = confusion_matrix(y_test, pred_test)
+
+    metrics = {
+        "auc_test": auc,
+        "cm_test": cm.tolist(),
+        "n_train": int(len(X_train)),
+        "n_test": int(len(X_test)),
+        "pos_rate": float(y.mean()),
+    }
+    return pipe, metrics
 
 
 # -----------------------------
@@ -218,9 +258,9 @@ with st.expander("How it works (short)"):
     )
 
 df = get_data()
-pipe = train_model(df)
+pipe, metrics = train_and_eval(df)
 
-# Sidebar inputs
+# Sidebar inputs + threshold
 st.sidebar.header("Input (baseline)")
 baseline: Dict[str, float] = {}
 
@@ -249,6 +289,10 @@ baseline["Age"] = st.sidebar.number_input(
     "Age (years)", min_value=1, max_value=120, value=33, step=1
 )
 
+st.sidebar.divider()
+threshold = st.sidebar.slider("Decision threshold", 0.05, 0.95, 0.50, 0.01)
+st.sidebar.caption("This threshold is for demo triage logic only.")
+
 baseline_warnings = format_imputation_warnings(baseline)
 
 # Prepare baseline row
@@ -257,47 +301,89 @@ x_base = replace_zeros_with_nan(x_base)
 
 risk_base = predict_risk(pipe, x_base)
 contrib_base, _ = compute_logit_contributions(pipe, x_base)
+up3_base, down3_base = top_drivers(contrib_base, k=3)
 
-# Layout
-col1, col2 = st.columns([1, 1], gap="large")
+flag_base = "Flagged (≥ threshold)" if risk_base >= threshold else "Not flagged (< threshold)"
 
-with col1:
-    st.subheader("Risk estimate (baseline)")
-    st.metric("Predicted probability", f"{risk_base:.2f}")
+# Build what-if values (start with baseline)
+# (These sliders live in the What-if tab but we compute here so report is consistent.)
+# We'll create placeholders; actual values set in What-if tab.
+# ------------------------------------------------------------
+tabs = st.tabs(["Baseline", "What-if", "Model & Limitations"])
 
-    if baseline_warnings:
-        st.warning("Missing values detected:\n\n- " + "\n- ".join(baseline_warnings))
+# -----------------------------
+# Baseline Tab
+# -----------------------------
+with tabs[0]:
+    left, right = st.columns([1, 1], gap="large")
 
-    st.caption("Note: This probability is a model output on a public dataset; it is not medical advice.")
+    with left:
+        st.subheader("Risk estimate (baseline)")
+        st.metric("Predicted probability", f"{risk_base:.2f}")
+        st.write(f"**Status @ threshold {threshold:.2f}:** {flag_base}")
 
-    st.subheader("Evidence (feature contributions)")
-    st.dataframe(contrib_base, use_container_width=True, hide_index=True)
+        if baseline_warnings:
+            st.warning("Missing values detected:\n\n- " + "\n- ".join(baseline_warnings))
 
-with col2:
+        st.caption("Note: This probability is a model output on a public dataset; it is not medical advice.")
+
+        st.subheader("Key drivers (baseline)")
+        cA, cB = st.columns(2)
+        with cA:
+            st.markdown("**↑ Increasing risk**")
+            if len(up3_base) == 0:
+                st.write("- (none)")
+            else:
+                for _, r in up3_base.iterrows():
+                    st.write(f"- {r['Feature']} ({r['Value']})")
+        with cB:
+            st.markdown("**↓ Decreasing risk**")
+            if len(down3_base) == 0:
+                st.write("- (none)")
+            else:
+                for _, r in down3_base.iterrows():
+                    st.write(f"- {r['Feature']} ({r['Value']})")
+
+    with right:
+        st.subheader("Evidence (feature contributions)")
+        st.caption(
+            "Interpretation note: contributions are computed on standardized inputs (z-scores). "
+            "A negative contribution means this value is lower than the dataset baseline in a way that reduces the model’s predicted risk."
+        )
+        with st.expander("Show full evidence table", expanded=True):
+            st.dataframe(contrib_base, use_container_width=True, hide_index=True)
+
+# -----------------------------
+# What-if Tab
+# -----------------------------
+with tabs[1]:
     st.subheader("What-if simulator (modifiable inputs)")
     st.write("Adjust modifiable inputs and compare the new prediction to baseline.")
 
-    w_glucose = st.slider(
-        "Glucose (mg/dL)",
-        min_value=0,
-        max_value=300,
-        value=int(baseline["Glucose"]),
-        step=1,
-    )
-    w_bmi = st.slider(
-        "BMI (kg/m²)",
-        min_value=0.0,
-        max_value=80.0,
-        value=float(baseline["BMI"]),
-        step=0.1,
-    )
-    w_bp = st.slider(
-        "Blood Pressure (mm Hg)",
-        min_value=0,
-        max_value=200,
-        value=int(baseline["BloodPressure"]),
-        step=1,
-    )
+    w_col1, w_col2 = st.columns([1, 1], gap="large")
+
+    with w_col1:
+        w_glucose = st.slider(
+            "Glucose (mg/dL)",
+            min_value=0,
+            max_value=300,
+            value=int(baseline["Glucose"]),
+            step=1,
+        )
+        w_bmi = st.slider(
+            "BMI (kg/m²)",
+            min_value=0.0,
+            max_value=80.0,
+            value=float(baseline["BMI"]),
+            step=0.1,
+        )
+        w_bp = st.slider(
+            "Blood Pressure (mm Hg)",
+            min_value=0,
+            max_value=200,
+            value=int(baseline["BloodPressure"]),
+            step=1,
+        )
 
     whatif = baseline.copy()
     whatif["Glucose"] = w_glucose
@@ -310,23 +396,111 @@ with col2:
     x_whatif = replace_zeros_with_nan(x_whatif)
 
     risk_new = predict_risk(pipe, x_whatif)
-    delta = risk_new - risk_base
+    delta = float(risk_new - risk_base)
+    flag_new = "Flagged (≥ threshold)" if risk_new >= threshold else "Not flagged (< threshold)"
 
-    st.metric("New probability", f"{risk_new:.2f}", delta=f"{delta:+.2f}")
+    contrib_new, _ = compute_logit_contributions(pipe, x_whatif)
+    up3_new, down3_new = top_drivers(contrib_new, k=3)
 
-    if whatif_warnings:
-        st.warning("Missing values detected in what-if inputs:\n\n- " + "\n- ".join(whatif_warnings))
+    with w_col2:
+        st.subheader("Result (what-if)")
+        st.metric("New probability", f"{risk_new:.2f}", delta=f"{delta:+.2f}")
+        st.write(f"**Status @ threshold {threshold:.2f}:** {flag_new}")
+
+        if whatif_warnings:
+            st.warning("Missing values detected in what-if inputs:\n\n- " + "\n- ".join(whatif_warnings))
+
+        st.subheader("Key drivers (what-if)")
+        cA, cB = st.columns(2)
+        with cA:
+            st.markdown("**↑ Increasing risk**")
+            if len(up3_new) == 0:
+                st.write("- (none)")
+            else:
+                for _, r in up3_new.iterrows():
+                    st.write(f"- {r['Feature']} ({r['Value']})")
+        with cB:
+            st.markdown("**↓ Decreasing risk**")
+            if len(down3_new) == 0:
+                st.write("- (none)")
+            else:
+                for _, r in down3_new.iterrows():
+                    st.write(f"- {r['Feature']} ({r['Value']})")
 
     st.subheader("Evidence (what-if)")
-    contrib_new, _ = compute_logit_contributions(pipe, x_whatif)
-    st.dataframe(contrib_new, use_container_width=True, hide_index=True)
+    st.caption(
+        "Interpretation note: contributions are computed on standardized inputs (z-scores). "
+        "Compare baseline vs what-if to see which factors changed the most."
+    )
+    with st.expander("Show full what-if evidence table", expanded=True):
+        st.dataframe(contrib_new, use_container_width=True, hide_index=True)
 
-st.divider()
-st.subheader("Limitations (v1)")
-st.markdown(
-    """
-- Uses a simple baseline model trained on a public dataset.
+    # Download report
+    report = {
+        "disclaimer": "Educational research prototype — not medical advice.",
+        "threshold": float(threshold),
+        "baseline": {
+            "inputs": {k: float(v) for k, v in baseline.items()},
+            "risk_probability": float(risk_base),
+            "status": flag_base,
+            "missing_imputed": baseline_warnings,
+            "top_drivers_up": [
+                {"feature": r["Feature"], "value": float(r["Value"]), "contribution_logodds": float(r["Contribution (log-odds)"])}
+                for _, r in up3_base.iterrows()
+            ],
+            "top_drivers_down": [
+                {"feature": r["Feature"], "value": float(r["Value"]), "contribution_logodds": float(r["Contribution (log-odds)"])}
+                for _, r in down3_base.iterrows()
+            ],
+        },
+        "what_if": {
+            "inputs": {k: float(v) for k, v in whatif.items()},
+            "risk_probability": float(risk_new),
+            "delta": float(delta),
+            "status": flag_new,
+            "missing_imputed": whatif_warnings,
+            "top_drivers_up": [
+                {"feature": r["Feature"], "value": float(r["Value"]), "contribution_logodds": float(r["Contribution (log-odds)"])}
+                for _, r in up3_new.iterrows()
+            ],
+            "top_drivers_down": [
+                {"feature": r["Feature"], "value": float(r["Value"]), "contribution_logodds": float(r["Contribution (log-odds)"])}
+                for _, r in down3_new.iterrows()
+            ],
+        },
+        "model_eval_holdout": metrics,
+    }
+
+    st.download_button(
+        "Download JSON report",
+        data=json.dumps(report, indent=2),
+        file_name="diabetes_triage_report.json",
+        mime="application/json",
+    )
+
+# -----------------------------
+# Model & Limitations Tab
+# -----------------------------
+with tabs[2]:
+    st.subheader("Model performance (holdout test split)")
+    st.write(f"- Train size: **{metrics['n_train']}**")
+    st.write(f"- Test size: **{metrics['n_test']}**")
+    st.write(f"- Positive rate in dataset: **{metrics['pos_rate']:.3f}**")
+    st.write(f"- ROC-AUC (test): **{metrics['auc_test']:.3f}**")
+
+    cm = np.array(metrics["cm_test"])
+    cm_df = pd.DataFrame(cm, index=["True 0", "True 1"], columns=["Pred 0", "Pred 1"])
+    st.write("Confusion matrix on test split at threshold 0.5 (reference):")
+    st.dataframe(cm_df, use_container_width=True)
+
+    st.subheader("Limitations (v1)")
+    st.markdown(
+        """
+- Uses a simple baseline Logistic Regression model trained on a public dataset.
 - Some fields use median imputation when missing (zeros treated as missing for certain features).
-- This tool is for educational demonstration only.
+- Holdout metrics are provided for transparency, but performance will vary by population and data quality.
+- This tool is for educational demonstration only; it does not provide medical advice.
 """
-)
+    )
+
+st.caption("© Research prototype demo. Consider adding a model card + dataset citation in README.")
