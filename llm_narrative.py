@@ -1,6 +1,5 @@
 import os
 from typing import List
-
 from openai import OpenAI
 
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
@@ -13,6 +12,8 @@ Rules:
 - Do NOT interpret results clinically.
 - Only explain what the model used and its limitations.
 - If unsure, say so explicitly.
+
+If a response would violate these rules, respond with a neutral explanation of limitations and uncertainty instead.
 """
 
 def build_prompt(
@@ -52,10 +53,9 @@ Write a short explanation with the following sections:
 Keep the tone neutral and non-clinical.
 """.strip()
 
-
 def generate_narrative(prompt: str) -> str:
     response = client.chat.completions.create(
-        model="gpt-4o-mini",
+        model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": prompt},
