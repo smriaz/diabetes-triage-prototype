@@ -51,7 +51,8 @@ Write a short explanation with the following sections:
 1. What the model used
 2. Main drivers of the prediction
 3. What the model cannot know
-4. Questions this result raises (questions only, no advice)
+4. Questions this model output raises
+
 
 Keep the tone neutral and non-clinical.
 """.strip()
