@@ -1,6 +1,9 @@
 import os
 from typing import List
 from openai import OpenAI
+import os
+print("OPENAI_API_KEY exists:", bool(os.getenv("OPENAI_API_KEY")))
+
 
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
