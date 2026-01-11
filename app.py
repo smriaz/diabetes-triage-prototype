@@ -14,6 +14,9 @@ from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
+# Milestone 2: LLM narrative layer (requires llm_narrative.py + OPENAI_API_KEY)
+from llm_narrative import build_prompt, generate_narrative
+
 # -----------------------------
 # Config
 # -----------------------------
@@ -212,7 +215,6 @@ def train_and_eval(df: pd.DataFrame):
     Returns:
       - trained pipeline
       - metrics dict
-      - train/test sizes
     """
     X = df[FEATURES]
     y = df[TARGET].astype(int)
@@ -254,6 +256,7 @@ with st.expander("How it works (short)"):
 - Treats zeros in some fields as missing and imputes using the dataset median.
 - Produces a risk probability and a *faithful* feature-contribution explanation.
 - Provides a what-if panel for modifiable inputs (glucose, BMI, blood pressure).
+- (Optional) Generates an LLM narrative explanation that is strictly non-diagnostic.
 """
     )
 
@@ -293,6 +296,11 @@ st.sidebar.divider()
 threshold = st.sidebar.slider("Decision threshold", 0.05, 0.95, 0.50, 0.01)
 st.sidebar.caption("This threshold is for demo triage logic only.")
 
+# Milestone 2: LLM toggle
+st.sidebar.divider()
+use_llm = st.sidebar.checkbox("Generate narrative explanation (LLM)", value=False)
+st.sidebar.caption("Explanatory only. No diagnosis or medical advice.")
+
 baseline_warnings = format_imputation_warnings(baseline)
 
 # Prepare baseline row
@@ -305,11 +313,7 @@ up3_base, down3_base = top_drivers(contrib_base, k=3)
 
 flag_base = "Flagged (≥ threshold)" if risk_base >= threshold else "Not flagged (< threshold)"
 
-# Build what-if values (start with baseline)
-# (These sliders live in the What-if tab but we compute here so report is consistent.)
-# We'll create placeholders; actual values set in What-if tab.
-# ------------------------------------------------------------
-tabs = st.tabs(["Baseline", "What-if", "Model & Limitations"])
+tabs = st.tabs(["Baseline", "What-if", "Narrative", "Model & Limitations"])
 
 # -----------------------------
 # Baseline Tab
@@ -479,9 +483,67 @@ with tabs[1]:
     )
 
 # -----------------------------
-# Model & Limitations Tab
+# Narrative Tab (Milestone 2)
 # -----------------------------
 with tabs[2]:
+    st.subheader("Narrative explanation (LLM-assisted)")
+    st.caption("This section explains the model output using only the evidence above. No medical advice is provided.")
+
+    if not use_llm:
+        st.info("Enable the LLM narrative from the sidebar to generate an explanation.")
+    else:
+        # Prefer what-if results if user has visited the What-if tab; otherwise fall back to baseline
+        has_whatif = "risk_new" in locals()
+
+        chosen_risk = risk_new if has_whatif else risk_base
+        chosen_flag = flag_new if has_whatif else flag_base
+        chosen_warnings = whatif_warnings if has_whatif else baseline_warnings
+
+        # Use baseline drivers for now; if you want, switch to up3_new/down3_new when has_whatif
+        chosen_up = up3_new if has_whatif else up3_base
+        chosen_down = down3_new if has_whatif else down3_base
+
+        prompt = build_prompt(
+            risk=chosen_risk,
+            threshold=threshold,
+            flag=chosen_flag,
+            top_up=[f"{r['Feature']} ({r['Value']})" for _, r in chosen_up.iterrows()],
+            top_down=[f"{r['Feature']} ({r['Value']})" for _, r in chosen_down.iterrows()],
+            imputation_notes=chosen_warnings,
+        )
+
+        with st.spinner("Generating explanation..."):
+            try:
+                narrative = generate_narrative(prompt)
+
+                # Simple post-guardrail (optional but recommended)
+                forbidden = ["diagnose", "treat", "should", "recommend", "medication", "doctor", "therapy"]
+                if any(w in narrative.lower() for w in forbidden):
+                    st.warning("Generated text exceeded safety bounds. Showing a neutral limitation statement instead.")
+                    st.markdown(
+                        "This is an educational model output based on limited features from a public dataset. "
+                        "It cannot be used for medical decisions."
+                    )
+                else:
+                    st.markdown(narrative)
+
+                with st.expander("Show LLM prompt (for transparency)"):
+                    st.code(prompt)
+
+            except Exception:
+                st.warning(
+                    "Narrative generation is unavailable (missing API key or network issue). "
+                    "Core model outputs are unaffected."
+                )
+                st.markdown(
+                    "This is an educational model output based on limited features from a public dataset. "
+                    "It cannot be used for medical decisions."
+                )
+
+# -----------------------------
+# Model & Limitations Tab
+# -----------------------------
+with tabs[3]:
     st.subheader("Model performance (holdout test split)")
     st.write(f"- Train size: **{metrics['n_train']}**")
     st.write(f"- Test size: **{metrics['n_test']}**")
@@ -493,14 +555,15 @@ with tabs[2]:
     st.write("Confusion matrix on test split at threshold 0.5 (reference):")
     st.dataframe(cm_df, use_container_width=True)
 
-    st.subheader("Limitations (v1)")
+    st.subheader("Limitations (v1 + narrative layer)")
     st.markdown(
         """
 - Uses a simple baseline Logistic Regression model trained on a public dataset.
 - Some fields use median imputation when missing (zeros treated as missing for certain features).
 - Holdout metrics are provided for transparency, but performance will vary by population and data quality.
+- The LLM narrative is constrained to explanation and questions only; it is not permitted to provide medical advice.
 - This tool is for educational demonstration only; it does not provide medical advice.
 """
     )
 
-st.caption("© Research prototype demo. Consider adding a model card + dataset citation in README.")
+st.caption("© Research prototype demo. Add dataset citation and a model card in the repository for completeness.")
